@@ -1,0 +1,404 @@
+// 2Dconvolution_param.cu
+// Minimal modifications from original 2Dconvolution sample to add param tuning:
+// - BLOCK_SIZE (thread block dimension)
+// - GRID_SCALE_X, GRID_SCALE_Y (grid multipliers)
+// - USE_SHARED (0/1) -> use shared memory tile of input
+// - USE_UNROLL (0/1) -> pragma unroll in inner loops
+// - STRIDE_ACCESS -> step size while iterating the filter
+//
+// Prints parseable metrics for the Python driver:
+//  - THREADS_PER_BLOCK, STRIDE_ACCESS, GFLOPS, MSEC_PER_KERNEL, RESULT (PASS/FAIL)
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include <sys/time.h>
+
+#include <cuda_runtime.h>
+
+// Default tunables (can be overriden via -D flags from nvcc)
+#ifndef BLOCK_SIZE
+#define BLOCK_SIZE 16
+#endif
+#ifndef GRID_SCALE_X
+#define GRID_SCALE_X 1.0f
+#endif
+#ifndef GRID_SCALE_Y
+#define GRID_SCALE_Y 1.0f
+#endif
+#ifndef USE_SHARED
+#define USE_SHARED 0
+#endif
+#ifndef USE_UNROLL
+#define USE_UNROLL 0
+#endif
+#ifndef STRIDE_ACCESS
+#define STRIDE_ACCESS 1
+#endif
+#ifndef KERNEL_SIZE
+#define KERNEL_SIZE 3
+#endif
+
+// Matrix structure (same as original simplified)
+typedef struct {
+    int width;
+    int height;
+    int pitch;
+    float *elements;
+} Matrix;
+
+// constant filter in device memory (original used constant)
+__constant__ float Mc[KERNEL_SIZE * KERNEL_SIZE];
+
+// Forward declaration of CPU reference
+extern "C" void computeGold(float*, const float*, const float*, unsigned int, unsigned int);
+
+// --- Kernel implementations ---
+// We'll keep two variants: shared (if enabled) and global
+
+// Shared-memory tiled kernel (safe, minimal)
+#if USE_SHARED
+__global__ void ConvolutionKernelShared(Matrix Nd, Matrix Pd, int height, int width)
+{
+    const int R = KERNEL_SIZE/2;
+    const int tileX = BLOCK_SIZE;
+    const int tileY = BLOCK_SIZE;
+
+    // shared tile dims: tile + 2*R for halo
+    extern __shared__ float sTile[]; // using extern shared memory sized at launch
+    // map 2D: sTile[(sy)*(tileX+2R) + sx]
+    int sharedW = tileX + 2*R;
+    int sharedH = tileY + 2*R;
+
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    int row = by * tileY + ty;
+    int block_cols = tileX; // WORK_PER_THREAD not used here to keep minimal change (user can increase BLOCK_SIZE)
+    int col_base = bx * tileX + tx;
+
+    // compute shared origin global coords
+    int origin_x = bx * tileX - R;
+    int origin_y = by * tileY - R;
+
+    // load shared tile (each thread loads multiple elements if needed)
+    for (int sy = ty; sy < sharedH; sy += tileY) {
+        for (int sx = tx; sx < sharedW; sx += tileX) {
+            int gx = origin_x + sx;
+            int gy = origin_y + sy;
+            float v = 0.0f;
+            if (gx >= 0 && gx < width && gy >= 0 && gy < height) {
+                v = Nd.elements[gy * width + gx];
+            }
+            sTile[sy * sharedW + sx] = v;
+        }
+    }
+    __syncthreads();
+
+    if (row >= height) return;
+
+    // compute
+    float acc = 0.0f;
+#if USE_UNROLL
+#pragma unroll
+#endif
+    for (int fy = 0; fy < KERNEL_SIZE; fy += STRIDE_ACCESS) {
+#if USE_UNROLL
+#pragma unroll
+#endif
+        for (int fx = 0; fx < KERNEL_SIZE; fx += STRIDE_ACCESS) {
+            int sx = tx + fx + R; // thread-local x + filter offset + halo
+            int sy = ty + fy + R;
+            float f = Mc[fy * KERNEL_SIZE + fx];
+            float inval = sTile[sy * sharedW + sx];
+            acc += f * inval;
+        }
+    }
+
+    // write to global
+    if (col_base < width) {
+        Pd.elements[row * width + col_base] = acc;
+    }
+}
+#endif // USE_SHARED
+
+// Global-memory kernel (no shared)
+__global__ void ConvolutionKernelGlobal(Matrix Nd, Matrix Pd, int height, int width)
+{
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    int row = by * BLOCK_SIZE + ty;
+    int col = bx * BLOCK_SIZE + tx;
+
+    if (row >= height || col >= width) return;
+
+    double sum = 0.0;
+#if USE_UNROLL
+#pragma unroll
+#endif
+    for (int fy = 0; fy < KERNEL_SIZE; fy += STRIDE_ACCESS) {
+#if USE_UNROLL
+#pragma unroll
+#endif
+        for (int fx = 0; fx < KERNEL_SIZE; fx += STRIDE_ACCESS) {
+            int iy = row + (fy - KERNEL_SIZE/2);
+            int ix = col + (fx - KERNEL_SIZE/2);
+            float val = 0.0f;
+            if (iy >= 0 && iy < height && ix >= 0 && ix < width) {
+                val = Nd.elements[iy * width + ix];
+            }
+            sum += (double)Mc[fy * KERNEL_SIZE + fx] * (double)val;
+        }
+    }
+    Pd.elements[row * width + col] = (float)sum;
+}
+
+// --- Host utility functions (from original) ---
+Matrix AllocateDeviceMatrix(const Matrix M)
+{
+    Matrix Mdevice = M;
+    int size = M.width * M.height * sizeof(float);
+    cudaMalloc((void**)&Mdevice.elements, size);
+    return Mdevice;
+}
+Matrix AllocateMatrix(int height, int width, int init)
+{
+    Matrix M;
+    M.width = M.pitch = width;
+    M.height = height;
+    int size = M.width * M.height;
+    M.elements = NULL;
+
+    if(init == 2)
+        return M;
+
+    M.elements = (float*) malloc(size*sizeof(float));
+    for(unsigned int i = 0; i < M.height * M.width; i++)
+    {
+        M.elements[i] = (init == 0) ? (0.0f) : (rand() / (float)RAND_MAX);
+        if(rand() % 2)
+            M.elements[i] = - M.elements[i];
+    }
+    return M;
+}
+void CopyToDeviceMatrix(Matrix Mdevice, const Matrix Mhost)
+{
+    int size = Mhost.width * Mhost.height * sizeof(float);
+    Mdevice.height = Mhost.height;
+    Mdevice.width = Mhost.width;
+    Mdevice.pitch = Mhost.pitch;
+    cudaMemcpy(Mdevice.elements, Mhost.elements, size, cudaMemcpyHostToDevice);
+}
+void CopyFromDeviceMatrix(Matrix Mhost, const Matrix Mdevice)
+{
+    int size = Mdevice.width * Mdevice.height * sizeof(float);
+    cudaMemcpy(Mhost.elements, Mdevice.elements, size, cudaMemcpyDeviceToHost);
+}
+void FreeDeviceMatrix(Matrix* M)
+{
+    cudaFree(M->elements);
+    M->elements = NULL;
+}
+void FreeMatrix(Matrix* M)
+{
+    free(M->elements);
+    M->elements = NULL;
+}
+
+// --- ConvolutionOnDevice: minimal changes to use the macros & metrics ---
+void ConvolutionOnDevice(const Matrix M, const Matrix N, Matrix P)
+{
+    // copy filter to constant memory
+    int size = M.width * M.height * sizeof(float);
+    cudaMemcpyToSymbol(Mc, M.elements, size);
+
+    Matrix Nd = AllocateDeviceMatrix(N);
+    CopyToDeviceMatrix(Nd, N);
+
+    Matrix Pd = AllocateDeviceMatrix(P);
+
+    // Setup the execution configuration
+    dim3 blockSize, gridSize;
+    blockSize.x = BLOCK_SIZE; blockSize.y = BLOCK_SIZE; blockSize.z = 1;
+
+    // compute grid based on original logic (TILE_SIZE replaced by BLOCK_SIZE)
+    int grid_x = (int)ceil((float)P.width / (float)BLOCK_SIZE);
+    int grid_y = (int)ceil((float)P.height / (float)BLOCK_SIZE);
+
+    // apply scaling multipliers (keeps correctness because kernel checks bounds)
+    grid_x = (int)ceilf(grid_x * GRID_SCALE_X);
+    grid_y = (int)ceilf(grid_y * GRID_SCALE_Y);
+    if (grid_x < 1) grid_x = 1;
+    if (grid_y < 1) grid_y = 1;
+
+    gridSize.x = grid_x; gridSize.y = grid_y; gridSize.z = 1;
+
+    // Launch the device computation threads!
+    printf("THREADS_PER_BLOCK: %d\n", blockSize.x * blockSize.y);
+    printf("STRIDE_ACCESS: %d\n", STRIDE_ACCESS);
+
+    // Warmup + timed kernels
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    // warmup
+#if USE_SHARED
+    // We need to choose a shared memory size: (BLOCK_SIZE + 2*R)^2 floats
+    int R = KERNEL_SIZE/2;
+    size_t shbytes = (BLOCK_SIZE + 2*R) * (BLOCK_SIZE + 2*R) * sizeof(float);
+    ConvolutionKernelShared<<<gridSize, blockSize, shbytes>>>(Nd, Pd, N.height, N.width);
+#else
+    ConvolutionKernelGlobal<<<gridSize, blockSize>>>(Nd, Pd, N.height, N.width);
+#endif
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("CUDA launch (warmup) error: %s\n", cudaGetErrorString(err));
+        // cleanup
+        FreeDeviceMatrix(&Nd);
+        FreeDeviceMatrix(&Pd);
+        return;
+    }
+    cudaDeviceSynchronize();
+
+    // timed iterations
+    int nIter = 300;
+    cudaEventRecord(start, 0);
+    for (int i = 0; i < nIter; ++i) {
+#if USE_SHARED
+        ConvolutionKernelShared<<<gridSize, blockSize, shbytes>>>(Nd, Pd, N.height, N.width);
+#else
+        ConvolutionKernelGlobal<<<gridSize, blockSize>>>(Nd, Pd, N.height, N.width);
+#endif
+    }
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("CUDA launch (timed) error: %s\n", cudaGetErrorString(err));
+        FreeDeviceMatrix(&Nd);
+        FreeDeviceMatrix(&Pd);
+        return;
+    }
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+
+    float kernelElapsed = 0.0f;
+    cudaEventElapsedTime(&kernelElapsed, start, stop);
+    float msecPerKernel = kernelElapsed / (float)nIter;
+
+    // compute ops: for convolution each output involves KERNEL_SIZE*KERNEL_SIZE multiplications and adds
+    double flops = 2.0 * (double)P.width * (double)P.height * (double)KERNEL_SIZE * (double)KERNEL_SIZE;
+    double gflops = (flops * 1e-9) / (msecPerKernel / 1000.0);
+
+    printf("GFLOPS: %.6f\n", gflops);
+    // Keep the old printf name for Python parsing similarity
+    printf("MSEC_PER_KERNEL: %.6f\n", msecPerKernel);
+
+    // Read P from the device
+    CopyFromDeviceMatrix(P, Pd);
+
+    // Free device matrices
+    FreeDeviceMatrix(&Nd);
+    FreeDeviceMatrix(&Pd);
+}
+
+// --- main: match original flow closely, but set default sizes from BLOCK_SIZE like matmul sample ---
+int main(int argc, char** argv) {
+
+    Matrix M, N, P;
+    srand(2012);
+
+    if (argc != 5 && argc != 4) {
+        // Allocate and initialize the matrices
+        M  = AllocateMatrix(KERNEL_SIZE, KERNEL_SIZE, 1);
+        N  = AllocateMatrix((rand() % 1024) + 1, (rand() % 1024) + 1, 1);
+        P  = AllocateMatrix(N.height, N.width, 0);
+    } else {
+        int* params = (int*) malloc(2*sizeof(int));
+        unsigned int data_read = 0;
+        FILE* pf = fopen(argv[1],"r");
+        if(pf) {
+            data_read = fscanf(pf, "%d %d", &params[0], &params[1])==2 ? 2 : 0;
+            fclose(pf);
+        }
+        if(data_read != 2) {
+            printf("Error reading parameter file\n");
+            return 1;
+        }
+        M  = AllocateMatrix(KERNEL_SIZE, KERNEL_SIZE, 0);
+        N  = AllocateMatrix(params[0], params[1], 0);
+        P  = AllocateMatrix(params[0], params[1], 0);
+        free(params);
+        (void)ReadFile(&M, argv[2]);
+        (void)ReadFile(&N, argv[3]);
+    }
+
+    // Show configuration
+    printf("[2D Convolution Using CUDA] - Starting...\n");
+    printf("CONFIG: BLOCK_SIZE=%d GRID_SCALE_X=%.2f GRID_SCALE_Y=%.2f USE_SHARED=%d USE_UNROLL=%d STRIDE_ACCESS=%d KERNEL_SIZE=%d\n",
+           BLOCK_SIZE, GRID_SCALE_X, GRID_SCALE_Y, USE_SHARED, USE_UNROLL, STRIDE_ACCESS, KERNEL_SIZE);
+
+    // Run convolution on device
+    ConvolutionOnDevice(M, N, P);
+
+    // CPU gold for correctness
+    Matrix reference = AllocateMatrix(P.height, P.width, 0);
+    {
+        // computeGold is external; call and time it
+        cudaEvent_t st, sp;
+        cudaEventCreate(&st); cudaEventCreate(&sp);
+        cudaEventRecord(st);
+        computeGold(reference.elements, M.elements, N.elements, N.height, N.width);
+        cudaEventRecord(sp); cudaEventSynchronize(sp);
+        float elapsedTime=0; cudaEventElapsedTime(&elapsedTime, st, sp);
+        printf("Time taken by CPU Gold %f milliseconds.\n", elapsedTime);
+    }
+
+    // Compare results
+    bool res = CompareMatrices(reference, P);
+    printf("RESULT: %s\n", (res) ? "PASS" : "FAIL");
+
+    // Optionally write P as before
+    if(argc == 5) {
+        WriteFile(P, argv[4]);
+    } else if(argc == 2) {
+        WriteFile(P, argv[1]);
+    }
+
+    FreeMatrix(&M); FreeMatrix(&N); FreeMatrix(&P); FreeMatrix(&reference);
+    return res ? 0 : 1;
+}
+
+// --- keep the original helper implementations from the sample below ---
+// This file expects the original helper functions ReadFile and CompareMatrices etc.
+// We provide them here (minimal versions) so the file is self-contained:
+
+int ReadFile(Matrix* M, char* file_name)
+{
+    unsigned int data_read = M->width * M->height;
+    FILE* input = fopen(file_name, "r");
+    for (unsigned i = 0; i < data_read; i++)
+        fscanf(input, "%f", &(M->elements[i]));
+    return data_read;
+}
+void WriteFile(Matrix M, char* file_name)
+{
+    unsigned int size = M.width * M.height;
+    FILE* output = fopen(file_name, "w");
+    for (unsigned i = 0; i < size; i++) {
+        fprintf(output, "%f ", M.elements[i]);
+    }
+}
+bool CompareMatrices(Matrix A, Matrix B) {
+    unsigned int size = A.width * A.height;
+    if ( (A.width != B.width) || (A.height != B.height) ) return false;
+    for (unsigned i = 0; i < size; i++)
+        if (fabs(A.elements[i] - B.elements[i]) > 0.001f) return false;
+    return true;
+}
