@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+# profile_2dconv_params.py
+# Sweeps parameters and generates CSV identical in schema to matmul dataset.
+
+import subprocess, time, csv, re
+from itertools import product
+from pathlib import Path
+
+CUDA_SOURCE = "2Dconvolution_param.cu"
+CUDA_BINARY = "2dconv_param_bin"
+LOG_DIR = Path("power_logs_2dconv")
+CSV_FILE = Path("2dconv_dataset.csv")
+
+BLOCK_SIZES = [4, 8, 16, 32]
+GRID_SCALES = [1.0, 1.5, 2.0]
+SHARED = [0, 1]
+UNROLL = [0, 1]
+REGISTER_LIMITS = [32, 64, 128]
+WORK_PER_THREAD = [1]   # kept 1 because this minimal change option doesn't change algorithm to support WPT
+STRIDES = [1, 2, 4, 8]
+KERNEL_SIZES = [3]      # keep common kernel size; change if desired
+
+POWER_LOG_DURATION = 60
+NVIDIA_SMI_INTERVAL = 1
+
+SCRIPT_DIR = Path(__file__).parent.resolve()
+CUDA_SRC_PATH = SCRIPT_DIR / CUDA_SOURCE
+CUDA_BIN_PATH = SCRIPT_DIR / CUDA_BINARY
+LOG_DIR.mkdir(exist_ok=True)
+
+# Regexes to parse output
+GFLOPS_RE = re.compile(r"GFLOPS:\s*([0-9]*\.?[0-9]+)")
+MSEC_RE = re.compile(r"MSEC_PER_KERNEL:\s*([0-9]*\.?[0-9]+)")
+RESULT_RE = re.compile(r"RESULT:\s*(PASS|FAIL)")
+THREADS_RE = re.compile(r"THREADS_PER_BLOCK:\s*(\d+)")
+STRIDE_RE = re.compile(r"STRIDE_ACCESS:\s*(\d+)")
+CUDA_ERR_RE = re.compile(r"CUDA .* error: (.*)")
+
+def compile_cuda(block, grid, shared, unroll, reg, work, stride, ksize):
+    print(f"[Compiling] BLOCK={block}, GRID={grid}, SHARED={shared}, UNROLL={unroll}, REG={reg}, WORK={work}, STRIDE={stride}, K={ksize}")
+    cmd = [
+        "nvcc", "-O3", f"--maxrregcount={reg}",
+        f"-DBLOCK_SIZE={block}",
+        f"-DGRID_SCALE_X={grid}f",
+        f"-DGRID_SCALE_Y={grid}f",
+        f"-DUSE_SHARED={shared}",
+        f"-DUSE_UNROLL={unroll}",
+        f"-DSTRIDE_ACCESS={stride}",
+        f"-DKERNEL_SIZE={ksize}",
+        "-o", str(CUDA_BIN_PATH),
+        str(CUDA_SRC_PATH)
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        print("Compilation failed:\n", proc.stderr)
+        return False, proc.stderr
+    return True, proc.stdout
+
+def start_power_log(log_path):
+    cmd = [
+        "nvidia-smi",
+        "--query-gpu=power.draw",
+        "--format=csv,noheader,nounits",
+        "-l", str(NVIDIA_SMI_INTERVAL)
+    ]
+    f = open(log_path, "w")
+    p = subprocess.Popen(cmd, stdout=f, stderr=subprocess.DEVNULL)
+    return p, f
+
+def stop_power_log(proc, handle):
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    handle.close()
+    time.sleep(0.2)
+
+def parse_power_log(log_path):
+    vals = []
+    try:
+        with open(log_path, "r") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line: continue
+                try:
+                    v = float(line)
+                    vals.append(v)
+                except:
+                    pass
+    except:
+        return None, 0
+    if not vals:
+        return None, 0
+    return sum(vals)/len(vals), len(vals)
+
+def run_and_profile(block, grid, shared, unroll, reg, work, stride, ksize):
+    log_name = f"power_b{block}_g{grid}_s{shared}_u{unroll}_r{reg}_w{work}_str{stride}_k{ksize}.log"
+    log_path = LOG_DIR / log_name
+    proc, handle = start_power_log(log_path)
+    time.sleep(0.5)
+
+    start_time = time.time()
+    try:
+        run = subprocess.run([str(CUDA_BIN_PATH)], capture_output=True, text=True, timeout=900)
+        stdout = run.stdout + "\n" + run.stderr
+        exit_code = run.returncode
+    except subprocess.TimeoutExpired:
+        stdout = ""
+        exit_code = -1
+    end_time = time.time()
+    exec_time = end_time - start_time
+
+    # ensure power samples for POWER_LOG_DURATION
+    remaining = POWER_LOG_DURATION - (exec_time if exec_time < POWER_LOG_DURATION else 0)
+    if remaining > 0:
+        time.sleep(remaining)
+    stop_power_log(proc, handle)
+    avg_power, sample_count = parse_power_log(log_path)
+
+    gflops = None; msec = None; result = "FAIL"; threads_pb = None; stride_out = stride; cuda_err = None
+    m = GFLOPS_RE.search(stdout)
+    if m: gflops = float(m.group(1))
+    m = MSEC_RE.search(stdout)
+    if m: msec = float(m.group(1))
+    m = RESULT_RE.search(stdout)
+    if m: result = m.group(1)
+    m = THREADS_RE.search(stdout)
+    if m: threads_pb = int(m.group(1))
+    m = STRIDE_RE.search(stdout)
+    if m: stride_out = int(m.group(1))
+    m = CUDA_ERR_RE.search(stdout)
+    if m: cuda_err = m.group(1).strip()
+
+    return {
+        "block_size": block,
+        "grid_scale_x": grid,
+        "use_shared": shared,
+        "use_unroll": unroll,
+        "register_limit": reg,
+        "work_per_thread": work,
+        "stride_access": stride_out,
+        "threads_per_block": (block * block) if threads_pb is None else threads_pb,
+        "gflops": gflops,
+        "msec_per_matmul": msec,
+        "pass_fail": result,
+        "avg_power_watts": avg_power,
+        "exec_time_sec": exec_time,
+        "power_log_duration": sample_count * NVIDIA_SMI_INTERVAL,
+        "exit_code": exit_code,
+        "cuda_error_str": cuda_err,
+        "power_log_path": str(log_path)
+    }
+
+def main():
+    combos = list(product(BLOCK_SIZES, GRID_SCALES, SHARED, UNROLL, REGISTER_LIMITS, WORK_PER_THREAD, STRIDES, KERNEL_SIZES))
+    total = len(combos)
+    print(f"Total configurations: {total}")
+
+    header = ["block_size","grid_scale_x","use_shared","use_unroll","register_limit",
+              "work_per_thread","stride_access","threads_per_block","gflops","msec_per_matmul",
+              "pass_fail","avg_power_watts","exec_time_sec","power_log_duration",
+              "exit_code","cuda_error_str","power_log_path"]
+
+    first = not CSV_FILE.exists()
+    with open(CSV_FILE, "a", newline="") as csvf:
+        writer = csv.DictWriter(csvf, fieldnames=header)
+        if first: writer.writeheader()
+
+        for idx, (b,g,s,u,r,w,stride,ksize) in enumerate(combos, start=1):
+            print(f"\n=== Run {idx}/{total} ===")
+            threads_pb = b * b
+            if threads_pb > 1024:
+                print(f"Skipping config: threads_per_block={threads_pb} > 1024")
+                row = {k: "" for k in header}
+                row.update({"block_size": b, "grid_scale_x": g, "use_shared": s, "use_unroll": u, "register_limit": r, "work_per_thread": w, "stride_access": stride, "threads_per_block": threads_pb, "pass_fail": "SKIP_THREADS_LIMIT"})
+                writer.writerow(row); csvf.flush(); continue
+
+            ok, comp_out = compile_cuda(b,g,s,u,r,w,stride,ksize)
+            if not ok:
+                print("Compilation failed; writing COMPILE_FAIL row.")
+                row = {k: "" for k in header}
+                row.update({"block_size": b, "grid_scale_x": g, "use_shared": s, "use_unroll": u, "register_limit": r, "work_per_thread": w, "stride_access": stride, "threads_per_block": threads_pb, "pass_fail": "COMPILE_FAIL", "cuda_error_str": str(comp_out)})
+                writer.writerow(row); csvf.flush(); continue
+
+            res = run_and_profile(b,g,s,u,r,w,stride,ksize)
+            if res["exit_code"] != 0:
+                print(f"Binary failed exit_code={res['exit_code']} cuda_err={res['cuda_error_str']}")
+            else:
+                print(f"PASS/FAIL: {res['pass_fail']} | GFLOPS: {res['gflops']} | Time(ms): {res['msec_per_matmul']} | Power(W): {res['avg_power_watts']}")
+
+            writer.writerow({
+                "block_size": res["block_size"],
+                "grid_scale_x": res["grid_scale_x"],
+                "use_shared": res["use_shared"],
+                "use_unroll": res["use_unroll"],
+                "register_limit": res["register_limit"],
+                "work_per_thread": res["work_per_thread"],
+                "stride_access": res["stride_access"],
+                "threads_per_block": res["threads_per_block"],
+                "gflops": "" if res["gflops"] is None else ("%.6f" % res["gflops"]),
+                "msec_per_matmul": "" if res["msec_per_matmul"] is None else ("%.6f" % res["msec_per_matmul"]),
+                "pass_fail": res["pass_fail"],
+                "avg_power_watts": "" if res["avg_power_watts"] is None else ("%.3f" % res["avg_power_watts"]),
+                "exec_time_sec": ("%.3f" % res["exec_time_sec"]),
+                "power_log_duration": res["power_log_duration"],
+                "exit_code": res["exit_code"],
+                "cuda_error_str": res["cuda_error_str"],
+                "power_log_path": res["power_log_path"]
+            })
+            csvf.flush()
+            time.sleep(0.5)
+
+    print("\nAll runs finished. CSV saved to:", CSV_FILE.resolve())
+
+if __name__ == "__main__":
+    main()
